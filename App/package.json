@@ -1,0 +1,16 @@
+{
+  "name": "chaos-cicd-demo",
+  "version": "1.0.0",
+  "description": "Chaos Engineering CI/CD Demo",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "curl -f http://localhost:3000/health || exit 1"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
