@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bedrock-backed investigator Lambda. Subscribes to the alarms SNS topic,
+  asks Claude for an RCA + ROLLBACK/WAIT/MANUAL_INVESTIGATE decision,
+  posts to Slack via incoming webhook, and on ROLLBACK calls
+  codepipeline:RollbackStage.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  SNSTopicArn:
+    Type: String
+  ECSClusterName:
+    Type: String
+  ECSServiceName:
+    Type: String
+  PipelineName:
+    Type: String
+  ECSLogGroupName:
+    Type: String
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock cross-region inference profile id. Must be a profile (foundation model ids reject on-demand invocation for newer Claude models).
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region the Bedrock runtime client targets. Defaults to us-east-1 since that's where Anthropic terms are accepted on most accounts.
+  GitHubRepo:
+    Type: String
+    Default: adithyasubas/AIOps-AWS
+    Description: owner/repo for fetching the recent deploy commit's diff via the GitHub REST API.
+
+Resources:
+  # Note: the Slack incoming webhook URL is stored in SSM at
+  #   /chaos-demo/investigator/slack-webhook-url
+  # The operator creates this parameter manually as a SecureString before
+  # deploying so its value (a Slack token) never lives in template/state.
+
+  InvestigatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EnvironmentName}-investigator"
+      RetentionInDays: 7
+
+  InvestigatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: investigator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt InvestigatorLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-webhook-url"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*"
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ECSLogGroupName}*"
+              - Effect: Allow
+                Action:
+                  - codepipeline:ListPipelineExecutions
+                  - codepipeline:GetPipelineState
+                  - codepipeline:GetPipeline
+                  - codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
+              - Effect: Allow
+                Action:
+                  - codepipeline:RollbackStage
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}/*"
+
+  InvestigatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: InvestigatorLogGroup
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-investigator"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt InvestigatorRole.Arn
+      Code: ../lambda/investigator
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref ECSClusterName
+          ECS_SERVICE: !Ref ECSServiceName
+          PIPELINE_NAME: !Ref PipelineName
+          ECS_LOG_GROUP: !Ref ECSLogGroupName
+          SLACK_URL_PARAM: /chaos-demo/investigator/slack-webhook-url
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_REGION: !Ref BedrockRegion
+          GITHUB_REPO: !Ref GitHubRepo
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AlarmsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref SNSTopicArn
+      Endpoint: !GetAtt InvestigatorFunction.Arn
+
+  AllowSnsInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref InvestigatorFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SNSTopicArn
+
+Outputs:
+  InvestigatorFunctionArn:
+    Value: !GetAtt InvestigatorFunction.Arn
+  InvestigatorFunctionName:
+    Value: !Ref InvestigatorFunction

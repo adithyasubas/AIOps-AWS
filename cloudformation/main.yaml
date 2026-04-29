@@ -143,6 +143,25 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
+  InvestigatorStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./investigator.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        SNSTopicArn: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+        ECSClusterName: !GetAtt EcsStack.Outputs.ECSClusterName
+        ECSServiceName: !GetAtt EcsStack.Outputs.ECSServiceName
+        PipelineName: !GetAtt PipelineStack.Outputs.PipelineName
+        ECSLogGroupName: !GetAtt EcsStack.Outputs.ECSLogGroupName
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
 Outputs:
   ALBDnsName:
     Description: Public DNS of the ALB. Hit /, /health, /info.
@@ -167,5 +186,7 @@ Outputs:
     Value: !GetAtt ChaosStack.Outputs.CpuStressExperimentId
   WebhookBridgeFunctionName:
     Value: !GetAtt WebhookBridgeStack.Outputs.WebhookBridgeFunctionName
+  InvestigatorFunctionName:
+    Value: !GetAtt InvestigatorStack.Outputs.InvestigatorFunctionName
   DashboardName:
     Value: !GetAtt MonitoringStack.Outputs.DashboardName
