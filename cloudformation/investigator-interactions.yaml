@@ -48,6 +48,8 @@ Resources:
                 Action:
                   - codepipeline:StartPipelineExecution
                   - codepipeline:GetPipelineState
+                  - codepipeline:GetPipelineExecution
+                  - codepipeline:ListPipelineExecutions
                 Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
               - Effect: Allow
                 Action:

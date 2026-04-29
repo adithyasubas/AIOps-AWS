@@ -80,13 +80,43 @@ def respond_in_channel(response_url: str, text: str, thread_ts: str | None = Non
         LOG.error(f"response_url failed: {e}")
 
 
+def _commit_sha_for_execution(execution_id: str) -> str | None:
+    """Return the source commit SHA that ran in the given pipeline execution."""
+    try:
+        resp = cp.get_pipeline_execution(pipelineName=PIPELINE, pipelineExecutionId=execution_id)
+        revs = resp["pipelineExecution"].get("artifactRevisions") or []
+        return revs[0].get("revisionId") if revs else None
+    except Exception as e:
+        LOG.warning(f"could not resolve commit SHA for {execution_id}: {e}")
+        return None
+
+
+def _start_with_source(target_sha: str | None) -> str:
+    """Kick off a fresh pipeline run, pinned to a specific commit when known."""
+    kwargs: dict = {"name": PIPELINE}
+    if target_sha:
+        kwargs["sourceRevisions"] = [
+            {"actionName": "Source", "revisionType": "COMMIT_ID", "revisionValue": target_sha}
+        ]
+    resp = cp.start_pipeline_execution(**kwargs)
+    return resp.get("pipelineExecutionId", "?")
+
+
 def execute_rollback(target_execution_id: str | None) -> str:
+    # Resolve the commit SHA the operator wants us to redeploy. If we have it,
+    # the fallback path becomes a genuine rollback (re-deploy that commit) rather
+    # than a no-op re-run of current HEAD.
+    target_sha = _commit_sha_for_execution(target_execution_id) if target_execution_id else None
+
     if not target_execution_id:
         try:
-            resp = cp.start_pipeline_execution(name=PIPELINE)
-            return f"⚠️ No specific target execution; kicked off a fresh pipeline run `{resp.get('pipelineExecutionId', '?')}`."
+            new_id = _start_with_source(None)
+            return f"⚠️ No specific target execution provided; kicked off a fresh pipeline run `{new_id}` from current HEAD."
         except Exception as e:
             return f"❌ start_pipeline_execution failed: {e}"
+
+    # Try the native CodePipeline V2 rollback first — only works when the target
+    # is the immediately-prior *forward* Succeeded execution of the Deploy stage.
     try:
         resp = cp.rollback_stage(
             pipelineName=PIPELINE,
@@ -95,14 +125,20 @@ def execute_rollback(target_execution_id: str | None) -> str:
         )
         return f"✅ Rolled back Deploy stage to execution `{target_execution_id}` (rollback id `{resp.get('pipelineExecutionId', '?')}`)."
     except Exception as e:
+        # Fallback: re-run the pipeline pinned to the target execution's commit SHA.
         try:
-            resp = cp.start_pipeline_execution(name=PIPELINE)
+            new_id = _start_with_source(target_sha)
+            if target_sha:
+                return (
+                    f"⚠️ rollback_stage rejected ({type(e).__name__}); "
+                    f"started a new pipeline run `{new_id}` pinned to commit `{target_sha[:12]}` from `{target_execution_id}`."
+                )
             return (
-                f"⚠️ rollback_stage failed ({type(e).__name__}: {e}); "
-                f"fell back to a fresh pipeline run `{resp.get('pipelineExecutionId', '?')}`."
+                f"⚠️ rollback_stage rejected ({type(e).__name__}) and could not resolve target commit SHA; "
+                f"fell back to a fresh pipeline run `{new_id}` from current HEAD."
             )
         except Exception as e2:
-            return f"❌ rollback failed: {e}; fallback also failed: {e2}"
+            return f"❌ rollback_stage failed: {e}; fallback also failed: {e2}"
 
 
 def handler(event, context):
