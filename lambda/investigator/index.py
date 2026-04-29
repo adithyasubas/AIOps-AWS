@@ -262,7 +262,9 @@ def post_slack(url: str, alarm_name: str, decision: dict) -> None:
 
     blocks.append({"type": "divider"})
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Pick an option (recommended: " + (rec or "—") + ")*"}})
-    for opt in decision.get("options") or []:
+
+    options_list = decision.get("options") or []
+    for opt in options_list:
         oid = opt.get("id", "?")
         name = opt.get("name", "")
         desc = opt.get("description", "")
@@ -273,6 +275,40 @@ def post_slack(url: str, alarm_name: str, decision: dict) -> None:
             text += f"\n```{_truncate(cmd, 600)}```"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
 
+    # Interactive buttons. Click → Slack POSTs to API Gateway → investigator-actions Lambda.
+    # Requires the investigator-interactions stack deployed AND Slack app Interactivity enabled
+    # with the Request URL pointing at the API GW endpoint.
+    rollback_target = decision.get("rollback_target_execution_id")
+    kiro_message = ""
+    for opt in options_list:
+        if opt.get("id") == "C":
+            kiro_message = opt.get("command", "") or ""
+            break
+    btn_value = json.dumps(
+        {
+            "alarm_name": alarm_name,
+            "rollback_target_execution_id": rollback_target,
+            "kiro_message": kiro_message,
+        }
+    )
+    button_elements: list[dict] = []
+    for opt in options_list[:3]:
+        oid = opt.get("id", "?")
+        action_id = {"A": "option_a", "B": "option_b", "C": "option_c"}.get(oid)
+        if not action_id:
+            continue
+        btn = {
+            "type": "button",
+            "action_id": action_id,
+            "text": {"type": "plain_text", "text": f"{oid} — {_truncate(opt.get('name', ''), 30)}"},
+            "value": btn_value,
+        }
+        if oid == rec:
+            btn["style"] = "primary"
+        button_elements.append(btn)
+    if button_elements:
+        blocks.append({"type": "actions", "block_id": "investigator_actions", "elements": button_elements})
+
     if action == "ROLLBACK" and decision.get("rollback_target_execution_id"):
         blocks.append(
             {
@@ -280,7 +316,7 @@ def post_slack(url: str, alarm_name: str, decision: dict) -> None:
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": f":arrow_left: Auto-rolling back Deploy stage to execution `{decision['rollback_target_execution_id']}`",
+                        "text": f":information_source: Suggested rollback target execution: `{decision['rollback_target_execution_id']}`",
                     }
                 ],
             }

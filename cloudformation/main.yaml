@@ -162,6 +162,21 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
+  InvestigatorInteractionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./investigator-interactions.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        PipelineName: !GetAtt PipelineStack.Outputs.PipelineName
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
 Outputs:
   ALBDnsName:
     Description: Public DNS of the ALB. Hit /, /health, /info.
@@ -188,5 +203,10 @@ Outputs:
     Value: !GetAtt WebhookBridgeStack.Outputs.WebhookBridgeFunctionName
   InvestigatorFunctionName:
     Value: !GetAtt InvestigatorStack.Outputs.InvestigatorFunctionName
+  InvestigatorActionsApiUrl:
+    Description: Paste this URL into Slack app -> Interactivity & Shortcuts -> Request URL.
+    Value: !GetAtt InvestigatorInteractionsStack.Outputs.ActionsApiUrl
+  InvestigatorActionsFunctionName:
+    Value: !GetAtt InvestigatorInteractionsStack.Outputs.ActionsFunctionName
   DashboardName:
     Value: !GetAtt MonitoringStack.Outputs.DashboardName

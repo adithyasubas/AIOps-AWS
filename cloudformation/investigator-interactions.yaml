@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Slack interactivity endpoint. API Gateway HTTP API forwards Block Kit
+  button clicks to a handler Lambda which verifies the Slack signature and
+  executes the chosen action (no-op / RollbackStage / Kiro handoff).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  PipelineName:
+    Type: String
+
+Resources:
+  # SSM SecureString /chaos-demo/investigator/slack-signing-secret is created
+  # manually by the operator (CFN can't manage SecureString contents safely).
+
+  ActionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EnvironmentName}-investigator-actions"
+      RetentionInDays: 7
+
+  ActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ActionsLogGroup.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-signing-secret"
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                  - codepipeline:GetPipelineState
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
+              - Effect: Allow
+                Action:
+                  - codepipeline:RollbackStage
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}/*"
+
+  ActionsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ActionsLogGroup
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-investigator-actions"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ActionsRole.Arn
+      Code: ../lambda/investigator-actions
+      Environment:
+        Variables:
+          PIPELINE_NAME: !Ref PipelineName
+          SLACK_SIGNING_SECRET_PARAM: /chaos-demo/investigator/slack-signing-secret
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${EnvironmentName}-investigator-actions"
+      ProtocolType: HTTP
+      Tags:
+        Project: chaos-cicd-demo
+        Environment: demo
+        ManagedBy: CloudFormation
+
+  HttpIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ActionsFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /slack/actions"
+      Target: !Sub "integrations/${HttpIntegration}"
+
+  HttpStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ActionsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/slack/actions"
+
+Outputs:
+  ActionsApiUrl:
+    Description: Paste this URL into your Slack app's "Interactivity & Shortcuts > Request URL" field.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/slack/actions"
+  ActionsFunctionName:
+    Value: !Ref ActionsFunction
