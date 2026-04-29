@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Chaos CICD Demo — parent stack orchestrating VPC, ECS, Pipeline,
+  Monitoring, Chaos (FIS), and Webhook bridge nested stacks.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  GitHubOwner:
+    Type: String
+    Description: GitHub username or org that owns the application repo.
+  GitHubRepo:
+    Type: String
+    Default: AIOps-AWS
+  GitHubBranch:
+    Type: String
+    Default: main
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of an existing CodeStar GitHub connection (must be created in console first).
+  EnableNatGateway:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, adds a NAT Gateway (~$35/month). Default false runs Fargate in public subnets.
+
+Resources:
+  VpcStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./vpc.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        EnableNatGateway: !Ref EnableNatGateway
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  EcsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./ecs.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        VpcId: !GetAtt VpcStack.Outputs.VpcId
+        PublicSubnetIds: !GetAtt VpcStack.Outputs.PublicSubnetIds
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PipelineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./pipeline.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ECRRepositoryUri: !GetAtt EcsStack.Outputs.ECRRepositoryUri
+        ECRRepositoryName: !GetAtt EcsStack.Outputs.ECRRepositoryName
+        ECSClusterName: !GetAtt EcsStack.Outputs.ECSClusterName
+        ECSServiceName: !GetAtt EcsStack.Outputs.ECSServiceName
+        GitHubOwner: !Ref GitHubOwner
+        GitHubRepo: !Ref GitHubRepo
+        GitHubBranch: !Ref GitHubBranch
+        GitHubConnectionArn: !Ref GitHubConnectionArn
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./monitoring.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ECSClusterName: !GetAtt EcsStack.Outputs.ECSClusterName
+        ECSServiceName: !GetAtt EcsStack.Outputs.ECSServiceName
+        ALBArn: !GetAtt EcsStack.Outputs.ALBArn
+        TargetGroupArn: !GetAtt EcsStack.Outputs.TargetGroupArn
+        ECSLogGroupName: !GetAtt EcsStack.Outputs.ECSLogGroupName
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ChaosStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./chaos.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ECSClusterArn: !GetAtt EcsStack.Outputs.ECSClusterArn
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WebhookBridgeStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./webhook-bridge.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        SNSTopicArn: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  ALBDnsName:
+    Description: Public DNS of the ALB. Hit /, /health, /info.
+    Value: !GetAtt EcsStack.Outputs.ALBDnsName
+  ECRRepositoryUri:
+    Value: !GetAtt EcsStack.Outputs.ECRRepositoryUri
+  ECSClusterName:
+    Value: !GetAtt EcsStack.Outputs.ECSClusterName
+  ECSServiceName:
+    Value: !GetAtt EcsStack.Outputs.ECSServiceName
+  PipelineName:
+    Value: !GetAtt PipelineStack.Outputs.PipelineName
+  ArtifactBucketName:
+    Value: !GetAtt PipelineStack.Outputs.ArtifactBucketName
+  SNSTopicArn:
+    Value: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+  StopTasksExperimentId:
+    Value: !GetAtt ChaosStack.Outputs.StopTasksExperimentId
+  CpuStressExperimentId:
+    Value: !GetAtt ChaosStack.Outputs.CpuStressExperimentId
+  WebhookBridgeFunctionName:
+    Value: !GetAtt WebhookBridgeStack.Outputs.WebhookBridgeFunctionName
+  DashboardName:
+    Value: !GetAtt MonitoringStack.Outputs.DashboardName

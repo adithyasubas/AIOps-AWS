@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SNS topic + four CloudWatch alarms (UnhealthyHosts, High5xx, HighCPU,
+  TaskCountDrop) that fan out to the webhook-bridge Lambda. Optional dashboard.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  ECSClusterName:
+    Type: String
+  ECSServiceName:
+    Type: String
+  ALBArn:
+    Type: String
+  TargetGroupArn:
+    Type: String
+  ECSLogGroupName:
+    Type: String
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-alarms"
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-unhealthy-hosts"
+      AlarmDescription: ALB target group has at least one unhealthy target.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Select [5, !Split [":", !Ref TargetGroupArn]]
+        - Name: LoadBalancer
+          Value: !Select [1, !Split ["loadbalancer/", !Ref ALBArn]]
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  High5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-high-5xx"
+      AlarmDescription: Sustained 5xx response rate from ECS targets.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Select [1, !Split ["loadbalancer/", !Ref ALBArn]]
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-high-cpu"
+      AlarmDescription: ECS service CPU utilization over 80% for 2 minutes.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSClusterName
+        - Name: ServiceName
+          Value: !Ref ECSServiceName
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  TaskCountDropAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-task-count-drop"
+      AlarmDescription: Running task count fell below desired (2).
+      Namespace: ECS/ContainerInsights
+      MetricName: RunningTaskCount
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSClusterName
+        - Name: ServiceName
+          Value: !Ref ECSServiceName
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${EnvironmentName}-dashboard"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {
+                "type": "metric",
+                "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LBFull}" ],
+                    [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                    [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                  ],
+                  "period": 60,
+                  "stat": "Sum",
+                  "region": "${AWS::Region}",
+                  "title": "ALB requests + 2xx/5xx"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TGFull}", "LoadBalancer", "${LBFull}" ],
+                    [ ".", "HealthyHostCount", ".", ".", ".", "." ]
+                  ],
+                  "period": 60,
+                  "stat": "Maximum",
+                  "region": "${AWS::Region}",
+                  "title": "Healthy / Unhealthy hosts"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/ECS", "CPUUtilization", "ClusterName", "${ECSClusterName}", "ServiceName", "${ECSServiceName}" ],
+                    [ ".", "MemoryUtilization", ".", ".", ".", "." ]
+                  ],
+                  "period": 60,
+                  "stat": "Average",
+                  "region": "${AWS::Region}",
+                  "title": "ECS CPU / Memory"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${ECSClusterName}", "ServiceName", "${ECSServiceName}" ],
+                    [ ".", "DesiredTaskCount", ".", ".", ".", "." ]
+                  ],
+                  "period": 60,
+                  "stat": "Minimum",
+                  "region": "${AWS::Region}",
+                  "title": "Running vs Desired tasks"
+                }
+              }
+            ]
+          }
+        - LBFull: !Select [1, !Split ["loadbalancer/", !Ref ALBArn]]
+          TGFull: !Select [5, !Split [":", !Ref TargetGroupArn]]
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref AlarmTopic
+  DashboardName:
+    Value: !Ref Dashboard

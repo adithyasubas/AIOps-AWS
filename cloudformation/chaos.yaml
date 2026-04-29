@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Fault Injection Service (FIS) IAM role and two experiment templates:
+  stop-task and task-cpu-stress, both targeting tasks tagged ChaosReady=true.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  ECSClusterArn:
+    Type: String
+
+Resources:
+  FISRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FISChaosActions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeClusters
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:ListClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:StopTask
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ChaosReady: "true"
+              - Effect: Allow
+                Action:
+                  - ecs:TagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ecs:CreateAction: ["StopTask"]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  StopTasksExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: "Chaos: Stop all ECS tasks tagged ChaosReady=true to simulate application crash"
+      RoleArn: !GetAtt FISRole.Arn
+      StopConditions:
+        - Source: none
+      Targets:
+        ecsTargets:
+          ResourceType: aws:ecs:task
+          ResourceTags:
+            ChaosReady: "true"
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Ref ECSClusterArn
+      Actions:
+        StopTasks:
+          ActionId: aws:ecs:stop-task
+          Targets:
+            Tasks: ecsTargets
+      Tags:
+        Name: !Sub "${EnvironmentName}-stop-tasks"
+        Project: chaos-cicd-demo
+        Environment: demo
+        ManagedBy: CloudFormation
+        ExperimentType: task-stop
+
+  CpuStressExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: "Chaos: 90% CPU stress on ECS tasks for 5 minutes"
+      RoleArn: !GetAtt FISRole.Arn
+      StopConditions:
+        - Source: none
+      Targets:
+        ecsTargets:
+          ResourceType: aws:ecs:task
+          ResourceTags:
+            ChaosReady: "true"
+          SelectionMode: ALL
+          Parameters:
+            cluster: !Ref ECSClusterArn
+      Actions:
+        CpuStress:
+          ActionId: aws:ecs:task-cpu-stress
+          Parameters:
+            duration: PT5M
+            percent: "90"
+          Targets:
+            Tasks: ecsTargets
+      Tags:
+        Name: !Sub "${EnvironmentName}-cpu-stress"
+        Project: chaos-cicd-demo
+        Environment: demo
+        ManagedBy: CloudFormation
+        ExperimentType: cpu-stress
+
+Outputs:
+  StopTasksExperimentId:
+    Value: !Ref StopTasksExperiment
+  CpuStressExperimentId:
+    Value: !Ref CpuStressExperiment
