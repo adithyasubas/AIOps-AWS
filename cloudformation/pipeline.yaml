@@ -173,6 +173,7 @@ Resources:
                   - ecs:DescribeTasks
                   - ecs:ListTasks
                   - ecs:RegisterTaskDefinition
+                  - ecs:TagResource
                   - ecs:UpdateService
                 Resource: "*"
               - Effect: Allow
@@ -180,9 +181,8 @@ Resources:
                   - iam:PassRole
                 Resource: "*"
                 Condition:
-                  StringEqualsIfExists:
-                    iam:PassedToService:
-                      - ecs-tasks.amazonaws.com
+                  StringLike:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
 
   Pipeline:
     Type: AWS::CodePipeline::Pipeline

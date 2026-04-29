@@ -24,6 +24,19 @@ Parameters:
     AllowedValues: ["true", "false"]
     Default: "false"
     Description: If true, adds a NAT Gateway (~$35/month). Default false runs Fargate in public subnets.
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: ECS desired count. Default 0 for first deploy (ECR is empty); rerun deploy.sh after the pipeline pushes the first image to scale to 2.
+  EnableChaos:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Whether to create FIS experiment templates. Requires a one-time AWS FIS opt-in in the account (visit the FIS console first). Default false.
+
+Conditions:
+  CreateChaos: !Equals [!Ref EnableChaos, "true"]
 
 Resources:
   VpcStack:
@@ -49,6 +62,7 @@ Resources:
         EnvironmentName: !Ref EnvironmentName
         VpcId: !GetAtt VpcStack.Outputs.VpcId
         PublicSubnetIds: !GetAtt VpcStack.Outputs.PublicSubnetIds
+        DesiredCount: !Ref DesiredCount
       Tags:
         - Key: Project
           Value: chaos-cicd-demo
@@ -100,6 +114,7 @@ Resources:
 
   ChaosStack:
     Type: AWS::CloudFormation::Stack
+    Condition: CreateChaos
     Properties:
       TemplateURL: ./chaos.yaml
       Parameters:
@@ -145,8 +160,10 @@ Outputs:
   SNSTopicArn:
     Value: !GetAtt MonitoringStack.Outputs.SNSTopicArn
   StopTasksExperimentId:
+    Condition: CreateChaos
     Value: !GetAtt ChaosStack.Outputs.StopTasksExperimentId
   CpuStressExperimentId:
+    Condition: CreateChaos
     Value: !GetAtt ChaosStack.Outputs.CpuStressExperimentId
   WebhookBridgeFunctionName:
     Value: !GetAtt WebhookBridgeStack.Outputs.WebhookBridgeFunctionName

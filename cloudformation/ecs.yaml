@@ -12,6 +12,11 @@ Parameters:
   PublicSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Two public subnets for ALB (and Fargate tasks when NAT is disabled).
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: ECS service desired task count. Set to 0 on first deploy (ECR empty), then update to 2 after the pipeline pushes the first image.
 
 Resources:
   ECRRepository:
@@ -273,7 +278,7 @@ Resources:
       ServiceName: !Sub "${EnvironmentName}-service"
       Cluster: !Ref ECSCluster
       LaunchType: FARGATE
-      DesiredCount: 2
+      DesiredCount: !Ref DesiredCount
       TaskDefinition: !Ref TaskDefinition
       DeploymentConfiguration:
         MinimumHealthyPercent: 50

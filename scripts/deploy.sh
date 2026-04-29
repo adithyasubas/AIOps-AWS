@@ -13,6 +13,7 @@ STACK_NAME="${STACK_NAME:-chaos-cicd-demo}"
 REGION="${AWS_REGION:-ap-southeast-2}"
 ENVIRONMENT_NAME="${ENVIRONMENT_NAME:-chaos-demo}"
 ENABLE_NAT="${ENABLE_NAT_GATEWAY:-false}"
+ENABLE_CHAOS="${ENABLE_CHAOS:-false}"
 
 : "${GITHUB_OWNER:?GITHUB_OWNER is required (e.g. adithyasubas)}"
 GITHUB_REPO="${GITHUB_REPO:-AIOps-AWS}"
@@ -52,20 +53,63 @@ aws cloudformation package \
   --output-template-file packaged.yaml \
   --region "${REGION}"
 
-echo "Deploying stack: ${STACK_NAME}"
-aws cloudformation deploy \
-  --template-file packaged.yaml \
-  --stack-name "${STACK_NAME}" \
-  --region "${REGION}" \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-  --no-fail-on-empty-changeset \
-  --parameter-overrides \
-    EnvironmentName="${ENVIRONMENT_NAME}" \
-    GitHubOwner="${GITHUB_OWNER}" \
-    GitHubRepo="${GITHUB_REPO}" \
-    GitHubBranch="${GITHUB_BRANCH}" \
-    GitHubConnectionArn="${GITHUB_CONNECTION_ARN}" \
-    EnableNatGateway="${ENABLE_NAT}"
+deploy_with_count() {
+  local count="$1"
+  echo "==> Deploying stack with DesiredCount=${count}"
+  aws cloudformation deploy \
+    --template-file packaged.yaml \
+    --stack-name "${STACK_NAME}" \
+    --region "${REGION}" \
+    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides \
+      EnvironmentName="${ENVIRONMENT_NAME}" \
+      GitHubOwner="${GITHUB_OWNER}" \
+      GitHubRepo="${GITHUB_REPO}" \
+      GitHubBranch="${GITHUB_BRANCH}" \
+      GitHubConnectionArn="${GITHUB_CONNECTION_ARN}" \
+      EnableNatGateway="${ENABLE_NAT}" \
+      EnableChaos="${ENABLE_CHAOS}" \
+      DesiredCount="${count}"
+}
+
+# Phase 1: create the stack with DesiredCount=0 so the empty ECR doesn't trip the
+# deployment circuit breaker on initial create.
+deploy_with_count 0
+
+PIPELINE_NAME="$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" \
+  --query 'Stacks[0].Outputs[?OutputKey==`PipelineName`].OutputValue' --output text)"
+echo "Pipeline name: ${PIPELINE_NAME}"
+
+# Wait for the pipeline to push the first image to ECR. CodeStar connections
+# auto-trigger on stack creation, but if no execution exists yet, kick one off.
+sleep 10
+EXEC_COUNT=$(aws codepipeline list-pipeline-executions --pipeline-name "${PIPELINE_NAME}" --region "${REGION}" --query 'length(pipelineExecutionSummaries)' --output text 2>/dev/null || echo 0)
+if [ "${EXEC_COUNT}" = "0" ] || [ -z "${EXEC_COUNT}" ]; then
+  echo "No pipeline execution found, starting one manually..."
+  aws codepipeline start-pipeline-execution --name "${PIPELINE_NAME}" --region "${REGION}" >/dev/null
+fi
+
+echo "Waiting for first pipeline execution to succeed (this builds and pushes the Docker image)..."
+ECR_NAME="${ENVIRONMENT_NAME}-app"
+DEADLINE=$(( $(date +%s) + 1500 ))   # 25 min budget
+while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+  IMAGE_COUNT=$(aws ecr list-images --repository-name "${ECR_NAME}" --region "${REGION}" --query 'length(imageIds[?imageTag==`latest`])' --output text 2>/dev/null || echo 0)
+  PIPE_STATUS=$(aws codepipeline list-pipeline-executions --pipeline-name "${PIPELINE_NAME}" --region "${REGION}" --max-items 1 --query 'pipelineExecutionSummaries[0].status' --output text 2>/dev/null || echo "Unknown")
+  echo "  pipeline=${PIPE_STATUS}  ecr_latest_count=${IMAGE_COUNT}"
+  if [ "${IMAGE_COUNT}" -ge 1 ]; then
+    echo "ECR has the :latest tag — image is ready."
+    break
+  fi
+  if [ "${PIPE_STATUS}" = "Failed" ] || [ "${PIPE_STATUS}" = "Stopped" ]; then
+    echo "ERROR: pipeline ${PIPE_STATUS}. Check the AWS console: https://${REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE_NAME}/view?region=${REGION}"
+    exit 1
+  fi
+  sleep 30
+done
+
+# Phase 2: scale up to 2 tasks now that the image exists.
+deploy_with_count 2
 
 echo
 echo "Stack deployed. Outputs:"
@@ -79,6 +123,5 @@ echo "ALB: http://${ALB_DNS}/"
 echo "Health: http://${ALB_DNS}/health"
 echo
 echo "Next steps:"
-echo "  1. Push the application code to GitHub (${GITHUB_OWNER}/${GITHUB_REPO}, branch ${GITHUB_BRANCH}) to trigger the first pipeline run."
-echo "  2. Once the pipeline turns green, complete the DevOps Agent setup in scripts/setup-devops-agent.md."
-echo "  3. Run scripts/run-chaos.sh to demo the failure flow."
+echo "  1. Complete the DevOps Agent setup in scripts/setup-devops-agent.md (us-east-1 console)."
+echo "  2. Run scripts/run-chaos.sh stop to demo the failure flow."

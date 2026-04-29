@@ -65,20 +65,29 @@ AWS Console → Developer Tools → Settings → Connections → Create connecti
 
 Authorize via browser. Copy the resulting Connection ARN — you'll need it next.
 
-### 2. Run the deploy script
+### 2. (Optional, for chaos demo) Opt in to AWS FIS
+
+FIS requires a one-time per-account opt-in. Visit
+https://ap-southeast-2.console.aws.amazon.com/fis/home → Experiment templates → accept terms.
+If you skip this, deploy without `ENABLE_CHAOS=true` and add it later.
+
+### 3. Run the deploy script
 
 ```bash
 GITHUB_OWNER=adithyasubas \
 GITHUB_REPO=AIOps-AWS \
 GITHUB_BRANCH=main \
 GITHUB_CONNECTION_ARN=arn:aws:codeconnections:ap-southeast-2:235864149303:connection/<id> \
+ENABLE_CHAOS=false \
 bash scripts/deploy.sh
 ```
 
-The script will:
-- Create a CFN templates S3 bucket if needed.
-- Run `aws cloudformation package` and `deploy`.
-- Print the ALB DNS and stack outputs.
+The script does a two-phase deploy:
+- **Phase 1:** creates the stack with ECS `DesiredCount=0` (ECR is empty on first deploy — this avoids the deployment circuit breaker tripping).
+- Triggers the CodePipeline; waits for it to push the first image to ECR.
+- **Phase 2:** updates the stack with `DesiredCount=2`. ECS rolls out 2 healthy tasks.
+
+After FIS opt-in, re-run with `ENABLE_CHAOS=true` to add the experiment templates.
 
 ### 3. Push code to GitHub to trigger the pipeline
 
