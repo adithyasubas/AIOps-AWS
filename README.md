@@ -65,11 +65,19 @@ AWS Console → Developer Tools → Settings → Connections → Create connecti
 
 Authorize via browser. Copy the resulting Connection ARN — you'll need it next.
 
-### 2. (Optional, for chaos demo) Opt in to AWS FIS
+### 2. Chaos engine choice
 
-FIS requires a one-time per-account opt-in. Visit
-https://ap-southeast-2.console.aws.amazon.com/fis/home → Experiment templates → accept terms.
-If you skip this, deploy without `ENABLE_CHAOS=true` and add it later.
+This demo can drive failures two ways:
+
+- **`scripts/run-chaos.sh`** — no extra services. Stops ECS tasks directly via
+  `aws ecs stop-task`. Works on the AWS Free Plan. **Default path.**
+- **AWS FIS experiment templates** — fancier (CPU stress, multi-action experiments)
+  but FIS is **not available on the Free Plan**. Requires upgrading to a
+  pay-as-you-go account, then a one-time terms acceptance at
+  https://ap-southeast-2.console.aws.amazon.com/fis/home. Set `ENABLE_CHAOS=true`
+  on `deploy.sh` once available.
+
+Most users should leave `ENABLE_CHAOS=false` and use `run-chaos.sh`.
 
 ### 3. Run the deploy script
 
