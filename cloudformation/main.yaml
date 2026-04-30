@@ -225,6 +225,25 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
+  ChaosTriggerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./chaos-trigger.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ECSClusterName: !GetAtt EcsStack.Outputs.ECSClusterName
+        ECSServiceName: !GetAtt EcsStack.Outputs.ECSServiceName
+        PipelineName: !GetAtt PipelineStack.Outputs.PipelineName
+        AlarmsTopicArn: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+        IncidentMemoryTableName: !GetAtt InvestigatorStack.Outputs.IncidentMemoryTableName
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
 Outputs:
   ALBDnsName:
     Description: Public DNS of the ALB. Hit /, /health, /info.
@@ -258,5 +277,10 @@ Outputs:
     Value: !GetAtt InvestigatorInteractionsStack.Outputs.ActionsFunctionName
   IncidentMemoryTableName:
     Value: !GetAtt InvestigatorStack.Outputs.IncidentMemoryTableName
+  ChaosTriggerFunctionName:
+    Value: !GetAtt ChaosTriggerStack.Outputs.ChaosTriggerFunctionName
+  ChaosTriggerConsoleUrl:
+    Description: Click this to open the Lambda console testing tab for the chaos trigger.
+    Value: !GetAtt ChaosTriggerStack.Outputs.ChaosTriggerConsoleUrl
   DashboardName:
     Value: !GetAtt MonitoringStack.Outputs.DashboardName

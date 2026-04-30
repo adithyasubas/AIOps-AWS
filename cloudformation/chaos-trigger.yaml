@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Console-invokable chaos trigger Lambda. Pick a mode in the test event JSON
+  to fire a synthetic alarm, stop ECS tasks, kick off a broken pipeline run,
+  or clear the incident-memory table.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: chaos-demo
+  ECSClusterName:
+    Type: String
+  ECSServiceName:
+    Type: String
+  PipelineName:
+    Type: String
+  AlarmsTopicArn:
+    Type: String
+  IncidentMemoryTableName:
+    Type: String
+
+Resources:
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EnvironmentName}-chaos-trigger"
+      RetentionInDays: 7
+
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: chaos-trigger
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TriggerLogGroup.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlarmsTopicArn
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IncidentMemoryTableName}"
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TriggerLogGroup
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-chaos-trigger"
+      Description: >
+        Demo chaos trigger. Invoke from Lambda console with one of:
+          {"mode":"fire_alarm","reason":"<msg>"}
+          {"mode":"stop_tasks"}
+          {"mode":"break_deploy","commit_sha":"<sha>"}
+          {"mode":"clear_memory"}
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt TriggerRole.Arn
+      Code: ../lambda/chaos-trigger
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref ECSClusterName
+          ECS_SERVICE: !Ref ECSServiceName
+          PIPELINE_NAME: !Ref PipelineName
+          ALARMS_TOPIC_ARN: !Ref AlarmsTopicArn
+          INCIDENT_MEMORY_TABLE_NAME: !Ref IncidentMemoryTableName
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  ChaosTriggerFunctionName:
+    Value: !Ref TriggerFunction
+  ChaosTriggerConsoleUrl:
+    Description: Open this URL in the AWS console to fire chaos events with one click.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${TriggerFunction}?tab=testing"
