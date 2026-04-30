@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Slack interactivity endpoint. API Gateway HTTP API forwards Block Kit
   button clicks to a handler Lambda which verifies the Slack signature and
-  executes the chosen action (no-op / RollbackStage / Kiro handoff).
+  executes the chosen action: ack, RollbackStage (with start-pipeline
+  fallback pinned to a target commit), GitHub PR creation, or Kiro handoff.
 
 Parameters:
   EnvironmentName:
@@ -10,10 +11,23 @@ Parameters:
     Default: chaos-demo
   PipelineName:
     Type: String
+  GitHubOwner:
+    Type: String
+    Default: adithyasubas
+  GitHubRepo:
+    Type: String
+    Default: AIOps-AWS
+  GitHubBaseBranch:
+    Type: String
+    Default: main
+  GitHubTokenParamName:
+    Type: String
+    Default: /chaos-demo/investigator/github-token
 
 Resources:
-  # SSM SecureString /chaos-demo/investigator/slack-signing-secret is created
-  # manually by the operator (CFN can't manage SecureString contents safely).
+  # SSM SecureStrings created manually:
+  #   /chaos-demo/investigator/slack-signing-secret  (Slack app signing secret)
+  #   <GitHubTokenParamName>                          (GitHub PAT, repo write)
 
   ActionsLogGroup:
     Type: AWS::Logs::LogGroup
@@ -43,7 +57,9 @@ Resources:
                 Resource: !GetAtt ActionsLogGroup.Arn
               - Effect: Allow
                 Action: ssm:GetParameter
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-signing-secret"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-signing-secret"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitHubTokenParamName}"
               - Effect: Allow
                 Action:
                   - codepipeline:StartPipelineExecution
@@ -65,7 +81,7 @@ Resources:
       FunctionName: !Sub "${EnvironmentName}-investigator-actions"
       Runtime: python3.12
       Handler: index.handler
-      Timeout: 15
+      Timeout: 30
       MemorySize: 256
       Role: !GetAtt ActionsRole.Arn
       Code: ../lambda/investigator-actions
@@ -73,6 +89,10 @@ Resources:
         Variables:
           PIPELINE_NAME: !Ref PipelineName
           SLACK_SIGNING_SECRET_PARAM: /chaos-demo/investigator/slack-signing-secret
+          GITHUB_OWNER: !Ref GitHubOwner
+          GITHUB_REPO: !Ref GitHubRepo
+          GITHUB_BASE_BRANCH: !Ref GitHubBaseBranch
+          GITHUB_TOKEN_PARAM_NAME: !Ref GitHubTokenParamName
       Tags:
         - Key: Project
           Value: chaos-cicd-demo

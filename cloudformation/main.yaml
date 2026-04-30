@@ -34,6 +34,39 @@ Parameters:
     AllowedValues: ["true", "false"]
     Default: "false"
     Description: Whether to create FIS experiment templates. Requires a one-time AWS FIS opt-in in the account (visit the FIS console first). Default false.
+  GitHubTokenParamName:
+    Type: String
+    Default: /chaos-demo/investigator/github-token
+    Description: SSM SecureString parameter holding a GitHub PAT with repo write access. Operator creates this manually before deploy.
+  AutoRemediateEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Master switch for automated rollback / PR creation. Default off; flip to true once you trust the agent's confidence calibration.
+  AutoRemediateConfidenceThreshold:
+    Type: Number
+    Default: 0.85
+    MinValue: 0
+    MaxValue: 1
+  AutoRemediateAllowedActions:
+    Type: String
+    Default: "rollback,create_pr"
+  AutoRemediateRequireLowRisk:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  IncidentMemoryEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  IncidentMemoryTtlDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+  MemoryMinSuccessCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
 
 Conditions:
   CreateChaos: !Equals [!Ref EnableChaos, "true"]
@@ -154,6 +187,17 @@ Resources:
         ECSServiceName: !GetAtt EcsStack.Outputs.ECSServiceName
         PipelineName: !GetAtt PipelineStack.Outputs.PipelineName
         ECSLogGroupName: !GetAtt EcsStack.Outputs.ECSLogGroupName
+        GitHubOwner: !Ref GitHubOwner
+        GitHubRepo: !Ref GitHubRepo
+        GitHubBaseBranch: !Ref GitHubBranch
+        GitHubTokenParamName: !Ref GitHubTokenParamName
+        AutoRemediateEnabled: !Ref AutoRemediateEnabled
+        AutoRemediateConfidenceThreshold: !Ref AutoRemediateConfidenceThreshold
+        AutoRemediateAllowedActions: !Ref AutoRemediateAllowedActions
+        AutoRemediateRequireLowRisk: !Ref AutoRemediateRequireLowRisk
+        IncidentMemoryEnabled: !Ref IncidentMemoryEnabled
+        IncidentMemoryTtlDays: !Ref IncidentMemoryTtlDays
+        MemoryMinSuccessCount: !Ref MemoryMinSuccessCount
       Tags:
         - Key: Project
           Value: chaos-cicd-demo
@@ -169,6 +213,10 @@ Resources:
       Parameters:
         EnvironmentName: !Ref EnvironmentName
         PipelineName: !GetAtt PipelineStack.Outputs.PipelineName
+        GitHubOwner: !Ref GitHubOwner
+        GitHubRepo: !Ref GitHubRepo
+        GitHubBaseBranch: !Ref GitHubBranch
+        GitHubTokenParamName: !Ref GitHubTokenParamName
       Tags:
         - Key: Project
           Value: chaos-cicd-demo
@@ -208,5 +256,7 @@ Outputs:
     Value: !GetAtt InvestigatorInteractionsStack.Outputs.ActionsApiUrl
   InvestigatorActionsFunctionName:
     Value: !GetAtt InvestigatorInteractionsStack.Outputs.ActionsFunctionName
+  IncidentMemoryTableName:
+    Value: !GetAtt InvestigatorStack.Outputs.IncidentMemoryTableName
   DashboardName:
     Value: !GetAtt MonitoringStack.Outputs.DashboardName

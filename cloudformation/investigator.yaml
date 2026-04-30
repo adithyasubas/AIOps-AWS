@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Bedrock-backed investigator Lambda. Subscribes to the alarms SNS topic,
-  asks Claude for an RCA + ROLLBACK/WAIT/MANUAL_INVESTIGATE decision,
-  posts to Slack via incoming webhook, and on ROLLBACK calls
-  codepipeline:RollbackStage.
+  Investigator Lambda + DynamoDB incident memory table. Subscribes to the
+  alarms SNS topic, checks memory for known incidents, falls back to Claude
+  via Bedrock when memory misses, posts a Slack RCA, and (optionally)
+  auto-remediates when confidence and risk thresholds are met.
 
 Parameters:
   EnvironmentName:
@@ -22,21 +22,80 @@ Parameters:
   BedrockModelId:
     Type: String
     Default: us.anthropic.claude-sonnet-4-6
-    Description: Bedrock cross-region inference profile id. Must be a profile (foundation model ids reject on-demand invocation for newer Claude models).
+    Description: Bedrock cross-region inference profile id. Foundation model ids reject on-demand invocation for newer Claude models.
   BedrockRegion:
     Type: String
     Default: us-east-1
-    Description: Region the Bedrock runtime client targets. Defaults to us-east-1 since that's where Anthropic terms are accepted on most accounts.
+    Description: Region the Bedrock runtime client targets.
+  GitHubOwner:
+    Type: String
+    Default: adithyasubas
   GitHubRepo:
     Type: String
-    Default: adithyasubas/AIOps-AWS
-    Description: owner/repo for fetching the recent deploy commit's diff via the GitHub REST API.
+    Default: AIOps-AWS
+  GitHubBaseBranch:
+    Type: String
+    Default: main
+  GitHubTokenParamName:
+    Type: String
+    Default: /chaos-demo/investigator/github-token
+    Description: SSM SecureString parameter holding a GitHub PAT with repo write access. Operator creates this manually before deploy.
+  AutoRemediateEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  AutoRemediateConfidenceThreshold:
+    Type: Number
+    Default: 0.85
+    MinValue: 0
+    MaxValue: 1
+  AutoRemediateAllowedActions:
+    Type: String
+    Default: "rollback,create_pr"
+    Description: Comma-separated list. Anything not listed cannot fire from auto-remediation.
+  AutoRemediateRequireLowRisk:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: When true, auto-remediation only fires for risk_level=LOW. When false, MEDIUM is also accepted.
+  IncidentMemoryEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  IncidentMemoryTtlDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+  MemoryMinSuccessCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Minimum success_count on a memory row before the investigator will reuse it instead of calling Bedrock.
 
 Resources:
-  # Note: the Slack incoming webhook URL is stored in SSM at
-  #   /chaos-demo/investigator/slack-webhook-url
-  # The operator creates this parameter manually as a SecureString before
-  # deploying so its value (a Slack token) never lives in template/state.
+  IncidentMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-incident-memory"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_signature
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_signature
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      Tags:
+        - Key: Project
+          Value: chaos-cicd-demo
+        - Key: Environment
+          Value: demo
+        - Key: ManagedBy
+          Value: CloudFormation
 
   InvestigatorLogGroup:
     Type: AWS::Logs::LogGroup
@@ -67,7 +126,9 @@ Resources:
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-webhook-url"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chaos-demo/investigator/slack-webhook-url"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitHubTokenParamName}"
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
@@ -99,6 +160,7 @@ Resources:
                   - codepipeline:ListPipelineExecutions
                   - codepipeline:GetPipelineState
                   - codepipeline:GetPipeline
+                  - codepipeline:GetPipelineExecution
                   - codepipeline:StartPipelineExecution
                 Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
               - Effect: Allow
@@ -107,6 +169,12 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}"
                   - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt IncidentMemoryTable.Arn
 
   InvestigatorFunction:
     Type: AWS::Lambda::Function
@@ -115,7 +183,7 @@ Resources:
       FunctionName: !Sub "${EnvironmentName}-investigator"
       Runtime: python3.12
       Handler: index.handler
-      Timeout: 60
+      Timeout: 90
       MemorySize: 512
       Role: !GetAtt InvestigatorRole.Arn
       Code: ../lambda/investigator
@@ -128,7 +196,18 @@ Resources:
           SLACK_URL_PARAM: /chaos-demo/investigator/slack-webhook-url
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           BEDROCK_REGION: !Ref BedrockRegion
+          GITHUB_OWNER: !Ref GitHubOwner
           GITHUB_REPO: !Ref GitHubRepo
+          GITHUB_BASE_BRANCH: !Ref GitHubBaseBranch
+          GITHUB_TOKEN_PARAM_NAME: !Ref GitHubTokenParamName
+          INCIDENT_MEMORY_TABLE_NAME: !Ref IncidentMemoryTable
+          INCIDENT_MEMORY_ENABLED: !Ref IncidentMemoryEnabled
+          INCIDENT_MEMORY_TTL_DAYS: !Ref IncidentMemoryTtlDays
+          MEMORY_MIN_SUCCESS_COUNT: !Ref MemoryMinSuccessCount
+          AUTO_REMEDIATE_ENABLED: !Ref AutoRemediateEnabled
+          AUTO_REMEDIATE_CONFIDENCE_THRESHOLD: !Ref AutoRemediateConfidenceThreshold
+          AUTO_REMEDIATE_ALLOWED_ACTIONS: !Ref AutoRemediateAllowedActions
+          AUTO_REMEDIATE_REQUIRE_LOW_RISK: !Ref AutoRemediateRequireLowRisk
       Tags:
         - Key: Project
           Value: chaos-cicd-demo
@@ -157,3 +236,5 @@ Outputs:
     Value: !GetAtt InvestigatorFunction.Arn
   InvestigatorFunctionName:
     Value: !Ref InvestigatorFunction
+  IncidentMemoryTableName:
+    Value: !Ref IncidentMemoryTable
