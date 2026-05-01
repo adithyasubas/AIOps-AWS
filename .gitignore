@@ -1,6 +1,33 @@
-# build artifacts
-packaged.yaml
-__pycache__/
-*.pyc
-node_modules/
+# macOS
 .DS_Store
+**/.DS_Store
+
+# build / package artefacts
+packaged.yaml
+*.zip
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# node
+node_modules/
+npm-debug.log*
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# secrets / local state - never commit
+.env
+.env.*
+*.pem
+*.key
+aws-credentials*
+.aws/
+slack-secret*
+github-token*

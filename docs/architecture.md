@@ -1,127 +1,145 @@
 # Architecture
 
-## Components
+This is a self-healing CI/CD pipeline for an ECS Fargate service, with an
+LLM-driven incident investigator on top of CloudWatch alarms.
 
-### Application
-A minimal Express.js API (`App/server.js`) with three endpoints:
-- `GET /` — service identity
-- `GET /health` — used by ALB target group + ECS task healthchecks
-- `GET /info` — host/platform/Node version
+## At a glance
 
-Containerised with `node:18-alpine`, runs as the non-root `node` user, and
-handles `SIGTERM` for graceful Fargate shutdowns.
+```mermaid
+flowchart TD
+    GH[GitHub: main branch] --> CP[CodePipeline V2]
+    CP --> CB[CodeBuild]
+    CB --> ECR[(ECR)]
+    CP --> ECSDeploy[ECS Deploy action<br/>OnFailure: ROLLBACK]
+    ECSDeploy --> SVC[ECS Fargate service]
+    SVC --> ALB[Application Load Balancer]
+    USR[Internet] --> ALB
 
-### Build & deploy
-- **CodePipeline V2** (`pipeline.yaml`) with three stages:
-  - **Source** — CodeStar Connection to GitHub.
-  - **Build** — CodeBuild with `PrivilegedMode: true` to run Docker. Pushes
-    the image to ECR with both the commit SHA and `latest` tags, and writes
-    `imagedefinitions.json` for the Deploy action.
-  - **Deploy** — ECS standard deploy provider. **`OnFailure.Result: ROLLBACK`**
-    triggers automatic rollback if the deploy fails (V1 does not support this —
-    the template is explicit `PipelineType: V2`).
-- **ECR** (`ecs.yaml`) with scan-on-push and a `keep-only-last-5` lifecycle
-  rule.
+    SVC -. metrics .-> CW[CloudWatch alarms]
+    CW --> SNS[SNS chaos-demo-alarms]
+    SNS --> INV[Investigator Lambda]
 
-### Runtime
-- **ECS Fargate cluster** with Container Insights and FARGATE + FARGATE_SPOT
-  capacity providers.
-- **Service** with desired count 2, deployment circuit breaker (also rollback
-  on stuck deploys), `MinHealthyPercent: 50`, `MaxPercent: 200`.
-- **Public ALB** in the two public subnets, ECS tasks attached via IP target
-  type. Tasks run with public IPs (NAT Gateway off by default for cost).
+    INV --> DDB[(DynamoDB<br/>incident memory)]
+    INV --> BR[Bedrock<br/>Claude Sonnet 4.6]
+    INV --> SLACK1[Slack<br/>incoming webhook]
 
-### Networking
-- VPC `10.0.0.0/16` across `ap-southeast-2a` / `ap-southeast-2b`.
-- 2 public subnets (10.0.1.0/24, 10.0.2.0/24), 2 private subnets (10.0.3.0/24,
-  10.0.4.0/24).
-- Conditional NAT Gateway (`EnableNatGateway` parameter, default `false`).
-- VPC Flow Logs (REJECTs only, 7-day retention) for audit visibility.
-- ALB SG: 80 from 0.0.0.0/0. ECS SG: 3000 from ALB SG only — no direct
-  internet → task path on the app port.
+    INV -. auto-remediate .-> CP
 
-### Observability
-- 4 CloudWatch alarms in `monitoring.yaml`:
-  - `UnHealthyHostCount` (TargetGroup) ≥ 1 for 60s
-  - `HTTPCode_Target_5XX_Count` (LB) ≥ 10 for 60s
-  - `CPUUtilization` (ECS service) ≥ 80% for 2 minutes
-  - `RunningTaskCount` (Container Insights) < 2 for 60s
-- All four feed the `chaos-demo-alarms` SNS topic.
-- A CloudWatch dashboard summarises requests, 5xx rate, healthy hosts, ECS
-  CPU/memory, and running vs desired tasks.
+    SLACK1 -. user clicks button .-> APIGW[API Gateway HTTP API]
+    APIGW --> ACT[Actions Lambda]
+    ACT --> CP
+    ACT --> GHAPI[GitHub REST API<br/>open fix PR]
 
-### Chaos
-- AWS FIS (`chaos.yaml`) with two experiment templates:
-  - **stop-task** — `aws:ecs:stop-task` on all tasks tagged `ChaosReady=true`.
-  - **task-cpu-stress** — 90% CPU for 5 minutes.
-- The FIS IAM role is least-privilege: `ecs:StopTask` is restricted by
-  `aws:ResourceTag/ChaosReady = "true"`. Targets are selected by tag, not ARN —
-  they survive task replacement during chaos runs.
+    TRIG[Chaos trigger Lambda<br/>console-clickable] -. fire alarm .-> SNS
+    TRIG -. stop tasks .-> SVC
+    TRIG -. break deploy .-> CP
+```
 
-### Webhook bridge
-- `webhook-bridge.yaml` provisions a Python 3.12 Lambda (`lambda/index.py`)
-  subscribed to the SNS topic.
-- Reads the DevOps Agent webhook URL + HMAC secret from SSM Parameter Store
-  (cached at module scope for warm-start performance).
-- Builds the Generic Webhook payload, signs with HMAC-SHA256, POSTs with
-  `X-Signature: sha256=<hex>` header.
-- Errors are logged but not re-raised — SNS retries would only flood the agent.
+## Three layers of intelligence
 
-## End-to-end data flow
+The investigator is the brain of the system. It does three things in
+sequence on every alarm.
 
-1. **Code push** to `main` on `github.com/adithyasubas/AIOps-AWS`.
-2. CodeStar Connection notifies CodePipeline → Source stage emits `SourceOutput`.
-3. CodeBuild pulls source, runs `buildspec.yml`: ECR login, `docker build` from
-   `App/`, push image, write `imagedefinitions.json`.
-4. ECS Deploy action updates the service with the new task definition. Circuit
-   breaker watches steady-state — if a fresh task fails healthcheck, deploy
-   rolls back automatically (`OnFailure: ROLLBACK`).
-5. **Chaos run**: `bash scripts/run-chaos.sh stop` calls
-   `aws fis start-experiment`. FIS calls `StopTask` on each `ChaosReady=true`
-   task.
-6. **Detection**: ALB target group transitions to unhealthy; `UnHealthyHostCount`
-   alarm breaches in <60s. `RunningTaskCount` alarm breaches in parallel.
-7. **Notification**: SNS topic publishes; Lambda is invoked; reads SSM secrets;
-   POSTs signed payload to DevOps Agent webhook in us-east-1.
-8. **Investigation**: DevOps Agent observes the topology, correlates the alarm
-   with recent deploys / config changes, and identifies the failure mode.
-9. **Slack message** with three remediation options:
-   - **A — Auto-rollback only.** ECS circuit breaker has already done this; no
-     further action.
-   - **B — Rollback + apply agent's fix.** Agent provides the recommended diff;
-     human applies it manually.
-   - **C — Rollback + delegate to Kiro.** Agent hands off the fix to Kiro,
-     which opens an automated PR.
+### 1. Memory (DynamoDB)
 
-## Security decisions
+Every investigation builds a stable signature from the alarm name,
+service, normalised error log content (timestamps and request IDs
+stripped), and the failed pipeline stage. If the same signature has been
+seen and resolved before, the Lambda reuses the stored decision and skips
+the Bedrock call entirely. PAY_PER_REQUEST billing, TTL on the row, no
+scans.
 
-- **No IAM wildcards** in `Action` for any role. `Resource: "*"` is only used
-  where AWS requires it (e.g. `ecr:GetAuthorizationToken`, generic
-  `ecs:Describe*` calls).
-- **HMAC-SHA256** on the webhook bridge so DevOps Agent can verify the
-  signature and reject spoofed alarms.
-- **SecureString SSM** for the webhook secret. Lambda role has GetParameter
-  scoped to those two parameter ARNs, nothing more.
-- **VPC Flow Logs** capture rejected traffic for audit.
-- **ECR image scan-on-push** surfaces CVEs before they reach Fargate.
-- **ALB SG** is the only path to ECS port 3000.
+The signature build is in `lambda/investigator/index.py:build_incident_signature`
+and the test in `tests/test_signature.py` exercises both the
+`normalize_error` cleanup and the SHA-256 hashing.
 
-## Cost-optimisation decisions
+### 2. Reasoning (Bedrock + Claude Sonnet 4.6)
 
-- **NAT Gateway off by default** — saves ~$35/month. Tasks run in public
-  subnets with public IPs. Trade-off: surface area is larger; ECS SG still
-  blocks inbound except from ALB SG.
-- **FARGATE_SPOT** in the cluster's capacity providers (the demo uses
-  FARGATE for steady tasks, but spot is available for ad hoc runs).
-- **256 CPU / 512 MB** task — minimum Fargate sizing.
-- **ECR `keep-last-5`** lifecycle.
-- **CloudWatch log retention 7 days**.
-- **S3 artifact bucket 30-day expiry**.
+On a memory miss, the Lambda gathers ECS service state, the last 15
+container log lines, the last 5 pipeline executions, and the diff of the
+most recent commit (via the GitHub REST API). It sends all of that to
+Claude with a structured prompt asking for:
 
-## The three remediation options (recap)
+- root cause and deploy correlation
+- implicated files and an excerpt of the offending lines
+- a fix as exact-match find/replace patches (so the actions Lambda can
+  apply them without ambiguity)
+- four options for the human (trust auto-rollback, run rollback, open PR,
+  delegate to Kiro)
+- a confidence score (0-1), risk level (LOW / MEDIUM / HIGH), and an
+  explicit `auto_remediation_safe` boolean
 
-| Option | Action | Operator effort | Best when |
-|---|---|---|---|
-| A | Accept ECS auto-rollback | None — already done | Transient/rare failure, low confidence in agent's fix |
-| B | Apply agent's recommended fix manually | Review + commit | High-confidence fix, human wants final say |
-| C | Delegate to Kiro for an automated PR | Approve PR | Low-risk fixes, repeatable patterns |
+### 3. Action (CodePipeline + GitHub)
+
+Either an operator clicks a Slack button or the auto-remediation gate
+fires. Both go through the same code paths.
+
+- **Rollback** uses `codepipeline:RollbackStage` first. If AWS rejects
+  it (common - it only accepts forward-deploy successes as targets),
+  the Lambda resolves the target execution's commit SHA via
+  `GetPipelineExecution` and re-runs the pipeline pinned to that SHA via
+  `start-pipeline-execution --source-revisions`. So the fallback is a
+  real rollback, not a no-op re-run of HEAD.
+
+- **Create fix PR** is intentionally narrower than applying a unified
+  diff. Each patch is a single-file find/replace. The Lambda fetches the
+  current file via the GitHub Contents API, refuses if `find` is not an
+  exact substring or if the path has any traversal pattern, replaces the
+  first occurrence only, commits to a fresh `aiops-fix/<signature>-<ts>`
+  branch, and opens a PR back to `main`. It never pushes to `main`.
+
+## Auto-remediation gate
+
+For an action to fire automatically (no human click), all of these must
+be true. The gate is in `lambda/investigator/index.py:auto_action_for`.
+
+- `AUTO_REMEDIATE_ENABLED=true` (master switch)
+- `confidence >= AUTO_REMEDIATE_CONFIDENCE_THRESHOLD` (default 0.85)
+- `risk_level == LOW` (or MEDIUM if `AUTO_REMEDIATE_REQUIRE_LOW_RISK=false`)
+- `auto_remediation_safe == true` (Claude's own safety check)
+- `recommended_option` is in `AUTO_REMEDIATE_ALLOWED_ACTIONS`
+- For `create_pr`, at least one valid patch is present
+
+If anything fails, the Slack message includes a `:lock:` line stating
+exactly which gate failed, so thresholds can be tuned based on observed
+behaviour.
+
+## Slack interactivity
+
+API Gateway HTTP API → actions Lambda. Every request is verified by
+HMAC-SHA256 over `v0:<timestamp>:<raw body>` against the Slack signing
+secret stored in SSM SecureString. Replay window is 5 minutes.
+
+Buttons carry a JSON `value` payload with the alarm context, the
+Bedrock-generated patches, the rollback target execution id, and the
+recommended option. The actions Lambda parses that, dispatches on
+`action_id`, and posts the result back via Slack's `response_url`.
+
+## Component map
+
+| Concern | Resource | Defined in |
+|---|---|---|
+| App | Express on Fargate, 2 tasks | `App/`, `cloudformation/ecs.yaml` |
+| Build & deploy | CodePipeline V2 + CodeBuild + ECR | `cloudformation/pipeline.yaml`, `buildspec.yml` |
+| Detection | 4 CloudWatch alarms + SNS topic | `cloudformation/monitoring.yaml` |
+| Investigator | Bedrock-backed Lambda + DDB memory | `cloudformation/investigator.yaml`, `lambda/investigator/` |
+| Slack interactivity | HTTP API + actions Lambda | `cloudformation/investigator-interactions.yaml`, `lambda/investigator-actions/` |
+| Demo trigger | Console-clickable Lambda | `cloudformation/chaos-trigger.yaml`, `lambda/chaos-trigger/` |
+| Optional FIS | Experiment templates | `cloudformation/chaos.yaml` (off by default) |
+
+## Deliberate limits
+
+- **AWS DevOps Agent path was abandoned.** We initially built a webhook
+  bridge to forward alarms to AWS DevOps Agent. The agent never produced
+  a response on either Free or Paid Plan in our test region. We removed
+  the bridge and built our own investigator on Bedrock. See
+  `docs/decisions.md`.
+- **AWS FIS is optional.** Free Plan accounts can't subscribe to FIS, so
+  the default chaos path is `aws ecs stop-task` via the chaos-trigger
+  Lambda.
+- **PR creation uses find/replace, not unified diffs.** Diffs are hard
+  to apply safely against a moving file. Find/replace with exact-match
+  required is narrower but predictable.
+- **Idempotency is not enforced.** SNS retries can fire the investigator
+  twice for the same alarm transition. A small DynamoDB lock keyed on
+  `<alarm,timestamp>` would dedupe.
